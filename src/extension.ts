@@ -191,10 +191,19 @@ async function runUploadFlow(input: UploadFlowInput): Promise<void> {
         }
 
         // 5. 选择目录（注意：null 应被透传，让 pickDirectory 激活「根目录」项）
-        const directory = await pickDirectory(client, project.id, last?.directoryId);
-        if (!directory) {
-            log.info('用户取消选择目录');
-            return;
+        //    autoModuleAndClassDir 模式下跳过目录选择，直接使用项目根目录，后续由 resolveTargetDirectoryId 自动创建两级目录
+        let directory: { id: string | null; name: string };
+        if (cfg.uploadMode === 'autoModuleAndClassDir') {
+            // autoModuleAndClassDir 模式：不需要用户选目录，直接在项目根目录下按 module + classDir 自动创建
+            directory = { id: null, name: '根目录 / 不分类' };
+            log.info('autoModuleAndClassDir 模式，跳过目录选择，将自动创建两级目录');
+        } else {
+            const picked = await pickDirectory(client, project.id, last?.directoryId);
+            if (!picked) {
+                log.info('用户取消选择目录');
+                return;
+            }
+            directory = picked;
         }
 
         // 6. 解析 host

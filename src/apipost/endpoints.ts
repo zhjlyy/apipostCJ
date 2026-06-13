@@ -1,21 +1,14 @@
 // 接口上传相关 API
-// 使用 V8 MCP JSON-RPC 协议：
-// - create_target：创建 API 节点（target_type: "api"）
+// 基于《开放接口文档 V2版本（saas版）》实现
+// - POST /open/apis/create → 创建 HTTP 类型接口
 // - 单个失败不阻断其他接口上传
 
 import type { ApipostClient } from './client';
 import type { ApiEndpoint, ApiParam, ApipostUploadResult, HttpMethod } from '../types';
 
-/** MCP create_target 响应结构 */
-interface CreateTargetResult {
-    code: number;
-    data: { target_id: string } | null;
-    msg: string;
-}
-
 /**
  * 批量上传接口到 Apipost
- * 使用 MCP create_target 方法逐个创建 API 节点
+ * 使用 POST /open/apis/create 逐个创建 API 节点
  */
 export async function uploadEndpoints(
     client: ApipostClient,
@@ -41,8 +34,8 @@ export async function uploadEndpoints(
     // 逐个上传
     for (const ep of endpoints) {
         try {
-            const body = buildCreateTargetParams(ep, projectId, directoryId, host);
-            await client.callMethod<CreateTargetResult>('create_target', body);
+            const body = buildApiCreateBody(ep, projectId, directoryId, host);
+            await client.post('/open/apis/create', body);
             success += 1;
         } catch (err) {
             failed += 1;
@@ -62,20 +55,20 @@ export async function uploadEndpoints(
 }
 
 /**
- * 将 ApiEndpoint 转为 MCP create_target 的参数
- * 字段映射遵循 V8 MCP create_target 的 schema 定义
+ * 将 ApiEndpoint 转为 POST /open/apis/create 的请求体
+ * 字段映射遵循 V2 文档定义
  */
-function buildCreateTargetParams(
+function buildApiCreateBody(
     ep: ApiEndpoint,
     projectId: string,
     directoryId: string | null,
     host: string
 ): Record<string, unknown> {
     // 按 in 位置分桶参数
-    const queryParams: McpParam[] = [];
-    const pathParams: McpParam[] = [];
-    const headerParams: McpParam[] = [];
-    const bodyParams: McpParam[] = [];
+    const queryParams: ApipostParam[] = [];
+    const pathParams: ApipostParam[] = [];
+    const headerParams: ApipostParam[] = [];
+    const bodyParams: ApipostParam[] = [];
 
     for (const p of ep.parameters) {
         const mapped = mapParam(p);
@@ -88,41 +81,78 @@ function buildCreateTargetParams(
         }
     }
 
-    // 构造请求体
-    const request: Record<string, unknown> = {};
+    // 拼接完整 URL（host + path）
+    const url = host ? `${host}${ep.path}` : ep.path;
 
-    // Query 参数
-    if (queryParams.length > 0) {
-        request['query'] = { parameter: queryParams };
-    }
-
-    // Path（restful）参数
-    if (pathParams.length > 0) {
-        request['restful'] = { parameter: pathParams };
-    }
-
-    // Header 参数
-    if (headerParams.length > 0) {
-        request['header'] = { parameter: headerParams };
-    }
+    // 构造 request 对象
+    const request: Record<string, unknown> = {
+        // Query 参数
+        query: { parameter: queryParams },
+        // Path（restful）参数
+        restful: { parameter: pathParams },
+        // Header 参数
+        header: { parameter: headerParams },
+        // Cookie 参数
+        cookie: { parameter: [] },
+        // 认证方式
+        auth: {
+            type: 'noauth',
+            kv: { key: '', value: '' },
+            bearer: { key: '' },
+            basic: { username: '', password: '' }
+        }
+    };
 
     // Body 参数
     if (ep.requestBodyType) {
-        // @RequestBody 整体对象：使用 json mode + schema
+        // @RequestBody 整体对象：使用 json mode
         request['body'] = {
             mode: 'json',
             raw: '{}',
-            parameter: bodyParams
+            parameter: bodyParams,
+            raw_parameter: [],
+            raw_schema: { type: 'object' },
+            binary: null
         };
     } else if (bodyParams.length > 0) {
         request['body'] = {
             mode: 'json',
-            parameter: bodyParams
+            parameter: bodyParams,
+            raw_parameter: [],
+            raw_schema: { type: 'object' },
+            binary: null
+        };
+    } else {
+        request['body'] = {
+            mode: 'none',
+            parameter: [],
+            raw: '',
+            raw_parameter: [],
+            raw_schema: { type: 'object' },
+            binary: null
         };
     }
 
-    // 拼接完整 URL（host + path）
-    const url = host ? `${host}${ep.path}` : ep.path;
+    // 构造 response 对象
+    const response: Record<string, unknown> = {
+        example: [
+            {
+                example_id: '1',
+                raw: '',
+                raw_parameter: [],
+                expect: {
+                    name: '成功',
+                    is_default: 1,
+                    code: '200',
+                    content_type: 'json',
+                    verify_type: 'schema',
+                    mock: '',
+                    schema: {}
+                }
+            }
+        ],
+        is_check_result: 1
+    };
 
     return {
         project_id: projectId,
@@ -131,15 +161,18 @@ function buildCreateTargetParams(
         parent_id: directoryId && directoryId.length > 0 ? directoryId : '0',
         method: ep.method,
         url,
+        protocol: 'http/1.1',
         description: ep.description || '',
-        tags: ep.tags,
+        mark_id: '1',
         request,
-        tool_version: ''
+        response,
+        attribute_info: {},
+        tags: ep.tags || []
     };
 }
 
-/** MCP 参数结构 */
-interface McpParam {
+/** Apipost V2 参数结构 */
+interface ApipostParam {
     key: string;
     value: string;
     description: string;
@@ -148,8 +181,8 @@ interface McpParam {
     is_checked: number; // 1=启用, -1=禁用
 }
 
-/** 将内部 ApiParam 转为 MCP 参数结构 */
-function mapParam(p: ApiParam): McpParam {
+/** 将内部 ApiParam 转为 Apipost V2 参数结构 */
+function mapParam(p: ApiParam): ApipostParam {
     return {
         key: p.name,
         value: p.defaultValue || '',
@@ -160,7 +193,7 @@ function mapParam(p: ApiParam): McpParam {
     };
 }
 
-/** 将 Java 类型映射为 MCP field_type */
+/** 将 Java 类型映射为 Apipost field_type */
 function mapFieldType(javaType: string): string {
     const lower = javaType.toLowerCase();
     if (lower === 'int' || lower === 'integer' || lower === 'long' || lower === 'short' || lower === 'byte') {
@@ -184,12 +217,13 @@ function mapFieldType(javaType: string): string {
 
 /** 拼接调试链接 */
 function buildDebugUrl(client: ApipostClient, projectId: string): string {
-    const base = client.baseUrl.replace(/\/+$/, '');
+    // Apipost 客户端链接（非 open API 地址）
+    const base = 'https://app.apipost.cn';
     return `${base}/project/${encodeURIComponent(projectId)}/apis`;
 }
 
 /** 拼接分享链接 */
 function buildShareUrl(client: ApipostClient, projectId: string): string {
-    const base = client.baseUrl.replace(/\/+$/, '');
+    const base = 'https://app.apipost.cn';
     return `${base}/share/project/${encodeURIComponent(projectId)}`;
 }

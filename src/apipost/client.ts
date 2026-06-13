@@ -1,6 +1,7 @@
-// Apipost V8 MCP JSON-RPC 客户端封装
-// V8 不提供传统 REST API，而是通过 MCP（Model Context Protocol）JSON-RPC 协议通信
-// 端点：POST {baseUrl}/mcp，鉴权：api-token header
+// Apipost V8 REST API 客户端封装
+// 基于《开放接口文档 V2版本（saas版）》实现
+// 鉴权方式：api-token header
+// 所有接口统一响应格式：{ code: 0, msg: "成功", data: ... }
 
 import type { ApipostConfig } from '../config/config';
 
@@ -22,16 +23,22 @@ export class ApipostHttpError extends Error {
     }
 }
 
-/** MCP JSON-RPC 请求 ID 计数器 */
-let rpcId = 1;
+/** Apipost 统一响应结构 */
+export interface ApipostResponse<T> {
+    code: number;
+    msg: string;
+    data: T;
+    time?: string;
+    extra_err?: Record<string, unknown>;
+}
 
 /**
- * Apipost V8 MCP 客户端
+ * Apipost V8 REST 客户端
  *
- * - 使用 MCP JSON-RPC 协议与 V8 通信
- * - 端点：POST {baseUrl}/mcp
  * - 鉴权：api-token header
+ * - 基础 URL：默认 https://open.apipost.net
  * - 内置 30 秒超时
+ * - 自动解析统一响应格式，code !== 0 时抛出业务异常
  */
 export class ApipostClient {
     private readonly config: ApipostConfig;
@@ -53,104 +60,114 @@ export class ApipostClient {
     }
 
     /**
-     * 调用 MCP JSON-RPC 方法
-     * @param method MCP 方法名（如 get_project_tree、create_target）
-     * @param params 方法参数
-     * @returns result 字段的内容
+     * 发送 GET 请求
+     * @param path 接口路径（如 /open/team/list）
+     * @param query 查询参数
+     * @returns data 字段的内容
      */
-    public async callMethod<T>(method: string, params: Record<string, unknown>): Promise<T> {
-        const url = `${this.baseUrl}/mcp`;
-        const id = rpcId++;
+    public async get<T>(path: string, query?: Record<string, string>): Promise<T> {
+        const url = buildUrl(this.baseUrl, path, query);
+        return this.request<T>('GET', url);
+    }
 
-        // 构造 JSON-RPC 请求体
-        const body = {
-            jsonrpc: '2.0',
-            id,
-            method,
-            params
-        };
+    /**
+     * 发送 POST 请求
+     * @param path 接口路径（如 /open/apis/create）
+     * @param body 请求体
+     * @returns data 字段的内容
+     */
+    public async post<T>(path: string, body?: Record<string, unknown>): Promise<T> {
+        const url = buildUrl(this.baseUrl, path);
+        return this.request<T>('POST', url, body);
+    }
 
+    /**
+     * 通用请求方法
+     * - 自动附加 api-token header
+     * - 自动解析统一响应格式
+     * - code !== 0 时抛出业务异常
+     */
+    private async request<T>(method: string, url: string, body?: Record<string, unknown>): Promise<T> {
+        // 提取路径用于错误信息
+        let urlPath: string;
+        try { urlPath = new URL(url).pathname; } catch { urlPath = url; }
         // 超时控制
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
+        // 构造请求选项
+        const opts: RequestInit = {
+            method,
+            headers: this.buildHeaders(),
+            signal: controller.signal
+        };
+        if (body && method !== 'GET') {
+            opts.body = JSON.stringify(body);
+        }
+
         let response: Response;
         try {
-            response = await fetch(url, {
-                method: 'POST',
-                headers: this.buildHeaders(),
-                body: JSON.stringify(body),
-                signal: controller.signal
-            });
+            response = await fetch(url, opts);
         } catch (err) {
             clearTimeout(timer);
             if (err instanceof Error && err.name === 'AbortError') {
                 throw new ApipostHttpError(
-                    `Apipost 请求超时（${this.timeoutMs}ms）: ${method}`,
-                    0, '', '/mcp'
+                    `Apipost 请求超时（${this.timeoutMs}ms）: ${method} ${urlPath}`,
+                    0, '', urlPath
                 );
             }
             const msg = err instanceof Error ? err.message : String(err);
             throw new ApipostHttpError(
-                `Apipost 网络错误: ${method} -> ${msg}`,
-                0, '', '/mcp'
+                `Apipost 网络错误: ${method} ${urlPath} -> ${msg}`,
+                0, '', urlPath
             );
         } finally {
             clearTimeout(timer);
         }
 
-        // 读取响应（SSE 格式，需要解析 event: message 行）
+        // 读取响应
         const rawText = await response.text();
         const snippet = rawText.slice(0, 2048);
 
         if (!response.ok) {
             throw new ApipostHttpError(
-                `Apipost 响应异常: ${method} -> HTTP ${response.status} ${response.statusText}`,
-                response.status, snippet, '/mcp'
+                `Apipost 响应异常: ${method} ${urlPath} -> HTTP ${response.status} ${response.statusText}`,
+                response.status, snippet, urlPath
             );
         }
 
-        // 解析 SSE 格式响应：提取 data: 行
-        const dataLine = parseSseData(rawText);
-        if (!dataLine) {
-            throw new ApipostHttpError(
-                `Apipost 响应格式异常: ${method} -> 未找到 data 行`,
-                response.status, snippet, '/mcp'
-            );
-        }
-
-        let rpcResponse: { jsonrpc: string; id: number; result?: T; error?: { code: number; message: string } };
+        // 解析 JSON
+        let resp: ApipostResponse<T>;
         try {
-            rpcResponse = JSON.parse(dataLine);
+            resp = JSON.parse(rawText);
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             throw new ApipostHttpError(
-                `Apipost 响应 JSON 解析失败: ${method} -> ${msg}`,
-                response.status, snippet, '/mcp'
+                `Apipost 响应 JSON 解析失败: ${method} ${urlPath} -> ${msg}`,
+                response.status, snippet, urlPath
             );
         }
 
-        // 检查 RPC 错误
-        if (rpcResponse.error) {
+        // 检查业务错误码
+        if (resp.code !== 0) {
             throw new ApipostHttpError(
-                `Apipost RPC 错误: ${method} -> [${rpcResponse.error.code}] ${rpcResponse.error.message}`,
-                response.status, dataLine.slice(0, 500), '/mcp'
+                `Apipost 业务错误: ${method} ${urlPath} -> [${resp.code}] ${resp.msg}`,
+                response.status, snippet, urlPath
             );
         }
 
-        return rpcResponse.result as T;
+        return resp.data;
     }
 
     /**
      * 构造请求头
-     * V8 鉴权方式：api-token header
+     * V2 鉴权方式：api-token header
      */
     private buildHeaders(): Record<string, string> {
         const headers: Record<string, string> = {
             'Content-Type': 'application/json',
-            'Accept': 'text/event-stream'
+            'Accept': 'application/json'
         };
-        // V8 鉴权：api-token header
         if (this.config.accessToken) {
             headers['api-token'] = this.config.accessToken;
         }
@@ -159,23 +176,16 @@ export class ApipostClient {
 }
 
 /**
- * 解析 SSE 格式响应，提取 data: 行的 JSON 内容
- * V8 MCP 返回格式：
- *   event: message
- *   data: {"jsonrpc":"2.0","id":1,"result":{...}}
+ * 拼接 URL（含查询参数）
  */
-function parseSseData(raw: string): string | null {
-    const lines = raw.split('\n');
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (line.startsWith('data:')) {
-            return line.substring(5).trim();
+function buildUrl(base: string, path: string, query?: Record<string, string>): string {
+    const url = new URL(path, base);
+    if (query) {
+        for (const [k, v] of Object.entries(query)) {
+            if (v !== undefined && v !== null && v !== '') {
+                url.searchParams.set(k, v);
+            }
         }
     }
-    // 如果不是 SSE 格式，尝试直接解析为 JSON
-    const trimmed = raw.trim();
-    if (trimmed.startsWith('{')) {
-        return trimmed;
-    }
-    return null;
+    return url.toString();
 }

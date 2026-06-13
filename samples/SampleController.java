@@ -21,6 +21,7 @@ import java.util.List;
  */
 @RestController
 @RequestMapping("/api/v1/users")
+@Api(tags = "用户管理")
 public class SampleController {
 
     /**
