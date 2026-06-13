@@ -1,0 +1,108 @@
+{
+  "name": "apipost-uploader",
+  "displayName": "Apipost 接口上传",
+  "description": "将选定的目录、类或方法中的所有接口上传到 Apipost",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:java",
+    "onCommand:apipost.uploadClass",
+    "onCommand:apipost.uploadDirectory",
+    "onCommand:apipost.uploadMethod"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "apipost.uploadClass",
+        "title": "Apipost: 上传该类的接口",
+        "category": "Apipost"
+      },
+      {
+        "command": "apipost.uploadDirectory",
+        "title": "Apipost: 上传该目录的接口",
+        "category": "Apipost"
+      },
+      {
+        "command": "apipost.uploadMethod",
+        "title": "Apipost: 上传当前方法的接口",
+        "category": "Apipost"
+      },
+      {
+        "command": "apipost.openSettings",
+        "title": "Apipost: 打开插件设置",
+        "category": "Apipost"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "apipost.uploadClass",
+          "when": "resourceExtname == .java",
+          "group": "apipost@1"
+        },
+        {
+          "command": "apipost.uploadDirectory",
+          "when": "explorerResourceIsFolder",
+          "group": "apipost@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "apipost.uploadMethod",
+          "when": "editorLangId == java",
+          "group": "apipost@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Apipost 接口上传",
+      "properties": {
+        "apipost.accessToken": {
+          "type": "string",
+          "default": "",
+          "description": "Apipost V8 项目的 OpenAPI 访问令牌（在 Apipost 客户端「项目设置 → OpenAPI」中获取）"
+        },
+        "apipost.baseUrl": {
+          "type": "string",
+          "default": "https://open.apipost.net",
+          "description": "Apipost 云端地址，默认 V8：https://open.apipost.net"
+        },
+        "apipost.uploadMode": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "autoClassDir",
+            "autoModuleAndClassDir"
+          ],
+          "default": "manual",
+          "description": "上传模式：manual=手动选择目录；autoClassDir=按类注释自动创建目录；autoModuleAndClassDir=按 module+类注释自动创建目录"
+        },
+        "apipost.host": {
+          "type": "string",
+          "default": "",
+          "description": "可选：手动覆盖 host（留空则从 application.yml/properties 解析）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.19.0",
+    "typescript": "^5.4.0",
+    "vsce": "^2.15.0"
+  }
+}
