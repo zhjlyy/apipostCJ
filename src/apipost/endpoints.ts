@@ -104,22 +104,25 @@ function buildApiCreateBody(
     };
 
     // Body 参数
+    // 构造 raw_schema（用于 Apipost 自动生成结构化的请求体）
+    const bodySchema = buildBodySchema(bodyParams);
     if (ep.requestBodyType) {
         // @RequestBody 整体对象：使用 json mode
         request['body'] = {
             mode: 'json',
-            raw: '{}',
+            raw: buildRawJsonExample(bodyParams),
             parameter: bodyParams,
             raw_parameter: [],
-            raw_schema: { type: 'object' },
+            raw_schema: bodySchema,
             binary: null
         };
     } else if (bodyParams.length > 0) {
         request['body'] = {
             mode: 'json',
+            raw: buildRawJsonExample(bodyParams),
             parameter: bodyParams,
             raw_parameter: [],
-            raw_schema: { type: 'object' },
+            raw_schema: bodySchema,
             binary: null
         };
     } else {
@@ -134,6 +137,8 @@ function buildApiCreateBody(
     }
 
     // 构造 response 对象
+    // 如果有响应 DTO 字段，生成 response schema
+    const responseSchema = buildResponseSchema(ep.responseFields);
     const response: Record<string, unknown> = {
         example: [
             {
@@ -147,7 +152,7 @@ function buildApiCreateBody(
                     content_type: 'json',
                     verify_type: 'schema',
                     mock: '',
-                    schema: {}
+                    schema: responseSchema
                 }
             }
         ],
@@ -213,6 +218,96 @@ function mapFieldType(javaType: string): string {
     }
     // 默认为 string
     return 'string';
+}
+
+/**
+ * 构造请求体 schema（基于 body 参数展开）
+ * - 格式遵循 Apipost V2 的 raw_schema 定义
+ * - 用于 Apipost 在 UI 中渲染结构化的请求体编辑面板
+ */
+function buildBodySchema(params: ApipostParam[]): Record<string, unknown> {
+    if (!params || params.length === 0) {
+        return { type: 'object', properties: {} };
+    }
+    const properties: Record<string, unknown> = {};
+    const required: string[] = [];
+    for (const p of params) {
+        const fieldType = p.field_type;
+        const prop: Record<string, unknown> = {
+            type: fieldType,
+            description: p.description || '',
+            mock: p.value ? { mock: p.value } : undefined
+        };
+        properties[p.key] = prop;
+        if (p.not_null === 1) {
+            required.push(p.key);
+        }
+    }
+    return {
+        type: 'object',
+        properties,
+        required: required.length > 0 ? required : undefined
+    };
+}
+
+/**
+ * 根据参数列表生成一个示例 JSON 字符串
+ * - 用于 Apipost 请求体"raw"字段展示
+ */
+function buildRawJsonExample(params: ApipostParam[]): string {
+    if (!params || params.length === 0) {
+        return '';
+    }
+    const obj: Record<string, unknown> = {};
+    for (const p of params) {
+        obj[p.key] = p.value !== '' ? p.value : defaultMockForType(p.field_type);
+    }
+    try {
+        return JSON.stringify(obj, null, 2);
+    } catch {
+        return '';
+    }
+}
+
+/** 根据字段类型生成一个合理的默认值 */
+function defaultMockForType(fieldType: string): unknown {
+    switch (fieldType) {
+        case 'string': return '';
+        case 'integer': return 0;
+        case 'number': return 0;
+        case 'boolean': return false;
+        case 'array': return [];
+        case 'object': return {};
+        default: return null;
+    }
+}
+
+/**
+ * 构造响应 schema（基于 DTO 字段展开）
+ * 格式遵循 Apipost V2 的 schema 定义
+ */
+function buildResponseSchema(fields: ApiParam[] | undefined): Record<string, unknown> {
+    if (!fields || fields.length === 0) {
+        return {};
+    }
+    // 构造 properties
+    const properties: Record<string, unknown> = {};
+    const required: string[] = [];
+    for (const f of fields) {
+        properties[f.name] = {
+            type: mapFieldType(f.type),
+            description: f.description || '',
+            mock: f.defaultValue ? { mock: f.defaultValue } : undefined
+        };
+        if (f.required) {
+            required.push(f.name);
+        }
+    }
+    return {
+        type: 'object',
+        properties,
+        required: required.length > 0 ? required : undefined
+    };
 }
 
 /** 拼接调试链接 */

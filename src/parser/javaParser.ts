@@ -3,6 +3,7 @@
 // 仅使用正则匹配实现，无外部 Java 解析依赖
 
 import * as fs from 'fs';
+import * as path from 'path';
 
 import { ApiEndpoint, ApiParam, ParamIn, ParsedJavaFile } from '../types';
 import { collectJavaFiles } from '../utils/fs';
@@ -102,11 +103,11 @@ function parseSource(filePath: string, source: string): ParsedJavaFile {
     const classCommentFirstLine = classCommentParsed?.summary || undefined;
     // 5. 类级 Swagger @Api
     const classApi = classAnnotations.find(a => shortName(a.name) === 'Api');
-    const swaggerApiName = classApi ? (classApi.attributes.find(a => a.key === 'tags')?.value || classApi.attributes.find(a => a.key === 'value')?.value) : undefined;
+    const swaggerApiName = classApi ? (classApi.attributes.find(a => a.key === 'tags')?.value || classApi.attributes.find(a => a.key === 'value')?.value || classApi.attributes.find(a => a.key === undefined)?.value) : undefined;
     // 6. 解析类内每个方法
     const endpoints: ApiEndpoint[] = [];
     for (const method of classInfo.methods) {
-        const ep = parseMethodFromSource(stripped, source, classInfo.className, classPathPrefix, method, classComment);
+        const ep = parseMethodFromSource(stripped, source, classInfo.className, classPathPrefix, method, classComment, filePath);
         if (ep) {
             // 7. 填充分类（tags）：@Api > @ApiOperation
             if (swaggerApiName) {
@@ -116,8 +117,8 @@ function parseSource(filePath: string, source: string): ParsedJavaFile {
                 }
             }
             // 8. 解析 module / classDirName
-            const classCommentText = classJavadoc?.body;
-            ep.classDirName = resolveClassDirName(classCommentText, swaggerApiName);
+            // 使用已解析的 classComment（不含 /** 和 */），而非原始 JavaDoc 文本
+            ep.classDirName = resolveClassDirName(classComment, swaggerApiName);
             ep.moduleName = resolveModuleName(filePath);
             endpoints.push(ep);
         }
@@ -606,7 +607,8 @@ function parseMethodFromSource(
     className: string,
     classPathPrefix: string | undefined,
     method: MethodSpan,
-    classComment: string | undefined
+    classComment: string | undefined,
+    filePath: string
 ): ApiEndpoint | undefined {
     void classComment;
     // 1. 取方法签名之上的注解（需原始源码识别 JavaDoc 边界）
@@ -649,6 +651,15 @@ function parseMethodFromSource(
     }
     // 8. requestBodyType
     const bodyParam = parameters.find(p => p.isBody);
+    // 9. 展开 @RequestBody DTO 字段（解析 @ApiModelProperty）
+    if (bodyParam && bodyParam.type) {
+        const dtoFields = expandDtoFields(bodyParam.type, filePath);
+        if (dtoFields.length > 0) {
+            // 移除原始的 body 参数，替换为 DTO 字段展开后的参数
+            const bodyIdx = parameters.indexOf(bodyParam);
+            parameters.splice(bodyIdx, 1, ...dtoFields);
+        }
+    }
     const endpoint: ApiEndpoint = {
         method: method_,
         path,
@@ -658,7 +669,9 @@ function parseMethodFromSource(
         methodName: method.name,
         parameters,
         requestBodyType: bodyParam?.type,
-        returnType: method.returnType
+        returnType: method.returnType,
+        // 10. 展开响应 DTO 字段
+        responseFields: expandResponseFields(method.returnType, filePath)
     };
     return endpoint;
 }
@@ -928,10 +941,310 @@ function unquoteSmart(s: string): string {
 }
 
 /**
+ * 展开 @RequestBody DTO 的字段为独立的 body 参数
+ * - 查找 DTO 源文件
+ * - 解析字段上的 @ApiModelProperty 注解
+ * - 返回展开后的 ApiParam 列表（in: 'body'）
+ *
+ * @param typeName DTO 类名（短名，如 XuanGangPositionCancelRequest）
+ * @param controllerFilePath 当前 Controller 文件的绝对路径
+ */
+function expandDtoFields(typeName: string, controllerFilePath: string): ApiParam[] {
+    // 去掉泛型
+    const shortType = stripGenerics(typeName).trim();
+    // 查找 DTO 源文件
+    const dtoPath = findDtoFile(shortType, controllerFilePath);
+    if (!dtoPath) {
+        return [];
+    }
+    let dtoSource: string;
+    try {
+        dtoSource = fs.readFileSync(dtoPath, 'utf8');
+    } catch {
+        return [];
+    }
+    // 解析 DTO 字段
+    return parseDtoFields(dtoSource);
+}
+
+/**
+ * 查找 DTO 源文件
+ * - 从当前 Controller 文件路径推断项目根目录
+ * - 支持单模块和多模块（Maven/Gradle）项目
+ * - 按类名匹配 .java 文件
+ */
+function findDtoFile(className: string, controllerFilePath: string): string | undefined {
+    const sourceDir = path.dirname(controllerFilePath);
+
+    // 策略1：向上查找最顶层的项目根目录（包含 pom.xml / build.gradle 的目录）
+    // 对于多模块项目，需要找到父级根目录（而非子模块目录）
+    let projectRoot: string | undefined;
+    let dir = sourceDir;
+    let lastBuildDir: string | undefined;
+    for (let i = 0; i < 30; i++) {
+        if (fs.existsSync(path.join(dir, 'pom.xml')) ||
+            fs.existsSync(path.join(dir, 'build.gradle')) ||
+            fs.existsSync(path.join(dir, 'build.gradle.kts'))) {
+            // 继续向上查找，取最顶层的构建目录
+            lastBuildDir = dir;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) {
+            break;
+        }
+        dir = parent;
+    }
+    projectRoot = lastBuildDir;
+
+    // 策略2：如果没找到构建文件，退回到找 src/ 目录的父目录
+    if (!projectRoot) {
+        dir = sourceDir;
+        for (let i = 0; i < 20; i++) {
+            if (fs.existsSync(path.join(dir, 'src'))) {
+                projectRoot = dir;
+                break;
+            }
+            const parent = path.dirname(dir);
+            if (parent === dir) {
+                break;
+            }
+            dir = parent;
+        }
+    }
+
+    if (!projectRoot) {
+        return undefined;
+    }
+
+    // 在项目根目录下搜索所有 src 目录中的 .java 文件
+    // 支持多模块：递归搜索所有子模块的 src 目录
+    const javaFiles = findAllJavaFiles(projectRoot);
+    const targetFile = javaFiles.find(f => path.basename(f, '.java') === className);
+    return targetFile;
+}
+
+/**
+ * 在项目根目录下查找所有 .java 文件
+ * - 递归搜索所有 src/main/java 和 src 目录
+ * - 跳过 target/build/node_modules 等构建产物目录
+ */
+function findAllJavaFiles(projectRoot: string): string[] {
+    const out: string[] = [];
+    walkForJava(projectRoot, out, 0);
+    return out;
+}
+
+/**
+ * 递归搜索 .java 文件，限制深度避免性能问题
+ */
+function walkForJava(dir: string, out: string[], depth: number): void {
+    if (depth > 15) {
+        return;
+    }
+    let entries: fs.Dirent[];
+    try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+        return;
+    }
+    for (const entry of entries) {
+        // 跳过构建产物和隐藏目录
+        if (entry.name === 'target' || entry.name === 'build' || entry.name === 'node_modules' ||
+            entry.name === '.git' || entry.name === '.idea' || entry.name === '.vscode' ||
+            entry.name.startsWith('.')) {
+            continue;
+        }
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            walkForJava(full, out, depth + 1);
+        } else if (entry.isFile() && entry.name.endsWith('.java')) {
+            out.push(full);
+        }
+    }
+}
+
+/**
+ * 解析 DTO 源文件中的字段
+ * - 识别 @ApiModelProperty 注解
+ * - 提取字段名、类型、描述、是否必填
+ */
+function parseDtoFields(dtoSource: string): ApiParam[] {
+    const fields: ApiParam[] = [];
+    // 使用 stripped 视图定位注解和字段
+    const stripped = stripStringsAndComments(dtoSource);
+    const strippedLines = stripped.split(/\r?\n/);
+    const originalLines = dtoSource.split(/\r?\n/);
+
+    // 逐行扫描：收集注解，遇到字段声明时将注解关联到字段
+    let pendingAnnotations: ParsedAnnotation[] = [];
+
+    for (let i = 0; i < strippedLines.length; i++) {
+        const trimmed = strippedLines[i].trim();
+        // 检测注解行
+        const annMatch = trimmed.match(/^@([A-Za-z_][A-Za-z0-9_]*)/);
+        if (annMatch) {
+            const annName = annMatch[1];
+            // 只关注可能出现在字段前的注解
+            if (annName === 'ApiModelProperty' || annName === 'NotNull' || annName === 'NotEmpty' ||
+                annName === 'NotBlank' || annName === 'Size' || annName === 'Min' || annName === 'Max' ||
+                annName === 'Valid' || annName === 'Deprecated') {
+                // 使用原始源码行解析注解（保留字符串参数）
+                const annLine = i + 1; // 1-based
+                const anns = findAnnotationsAbove(stripped, dtoSource, annLine);
+                if (anns.length > 0) {
+                    pendingAnnotations.push(...anns);
+                }
+            }
+            continue;
+        }
+        // 检测字段声明行：private/protected/public Type fieldName;
+        const fieldMatch = trimmed.match(/^(?:private|protected|public)\s+(\S+(?:<[^>]+>)?)\s+(\w+)\s*[;=]/);
+        if (fieldMatch) {
+            const fieldType = fieldMatch[1];
+            const fieldName = fieldMatch[2];
+            // 查找 @ApiModelProperty
+            const apiModelAnn = pendingAnnotations.find(a => shortName(a.name) === 'ApiModelProperty');
+            let description = '';
+            let required = false;
+            let example: string | undefined;
+            if (apiModelAnn) {
+                // value 属性
+                const valueAttr = apiModelAnn.attributes.find(a => a.key === 'value' || a.key === undefined);
+                if (valueAttr) {
+                    description = unquoteSmart(valueAttr.value);
+                }
+                // required 属性
+                const reqAttr = apiModelAnn.attributes.find(a => a.key === 'required');
+                if (reqAttr) {
+                    required = reqAttr.value === 'true';
+                }
+                // example 属性
+                const exAttr = apiModelAnn.attributes.find(a => a.key === 'example');
+                if (exAttr) {
+                    example = unquoteSmart(exAttr.value);
+                }
+            }
+            // JSR-303 校验注解也视为必填
+            if (!required) {
+                required = pendingAnnotations.some(a => {
+                    const n = shortName(a.name);
+                    return n === 'NotNull' || n === 'NotEmpty' || n === 'NotBlank';
+                });
+            }
+            fields.push({
+                name: fieldName,
+                type: stripGenerics(fieldType),
+                required,
+                in: 'body',
+                isBody: true,
+                description: description || undefined,
+                defaultValue: example
+            });
+            pendingAnnotations = [];
+            continue;
+        }
+        // 非注解非字段行：清空待处理注解（除非是空行或大括号）
+        if (trimmed !== '' && trimmed !== '{' && trimmed !== '}' && !trimmed.startsWith('//')) {
+            pendingAnnotations = [];
+        }
+    }
+    return fields;
+}
+
+/**
+ * 展开响应 DTO 的字段
+ * - 支持 GenericResponse<SomeDTO> 形式：提取泛型参数中的 DTO 类名
+ * - 支持 List<SomeDTO> 形式：提取元素类型
+ * - 支持 SomeDTO 直接形式
+ */
+function expandResponseFields(returnType: string | undefined, filePath: string): ApiParam[] | undefined {
+    if (!returnType) {
+        return undefined;
+    }
+    // 提取实际 DTO 类型名
+    const dtoType = extractDtoType(returnType);
+    if (!dtoType) {
+        return undefined;
+    }
+    const fields = expandDtoFields(dtoType, filePath);
+    return fields.length > 0 ? fields : undefined;
+}
+
+/**
+ * 从返回类型中提取 DTO 类名
+ * - GenericResponse<UserVO> → UserVO
+ * - ResponseEntity<UserVO> → UserVO
+ * - Result<UserVO> → UserVO
+ * - List<UserVO> → UserVO
+ * - GenericResponse<List<UserVO>> → UserVO（嵌套泛型）
+ * - UserVO → UserVO
+ * - void → undefined
+ * - 基本类型 → undefined
+ */
+function extractDtoType(returnType: string): string | undefined {
+    const t = returnType.trim();
+    // void 和基本类型不展开
+    if (t === 'void' || t === 'Void') {
+        return undefined;
+    }
+    const primitives = ['String', 'Integer', 'Long', 'Double', 'Float', 'Boolean', 'Byte', 'Short', 'Character',
+        'int', 'long', 'double', 'float', 'boolean', 'byte', 'short', 'char', 'Object', 'Map', 'BigDecimal',
+        'List', 'Set', 'Collection', 'ArrayList', 'HashSet', 'TreeSet', 'LinkedList'];
+    if (primitives.includes(t)) {
+        return undefined;
+    }
+    // 使用括号平衡算法提取最外层泛型参数
+    // 例如 GenericResponse<List<UserVO>> → List<UserVO>
+    const angleStart = t.indexOf('<');
+    const angleEnd = findMatchingAngleBracket(t, angleStart);
+    if (angleStart >= 0 && angleEnd > angleStart) {
+        const inner = t.substring(angleStart + 1, angleEnd);
+        // 如果内部还是泛型（如 List<UserVO>），递归提取
+        return extractDtoType(inner);
+    }
+    // 非泛型类型，判断是否为 DTO
+    if (primitives.includes(t)) {
+        return undefined;
+    }
+    return t;
+}
+
+/**
+ * 找到与 startIdx 处的 `<` 配对的 `>`
+ * - 使用括号平衡计数器，正确处理嵌套泛型
+ * - 例如 `GenericResponse<List<UserVO>>` 中第0位的 `<` 配对最后一个 `>`
+ */
+function findMatchingAngleBracket(text: string, startIdx: number): number {
+    if (startIdx < 0 || text[startIdx] !== '<') {
+        return -1;
+    }
+    let depth = 0;
+    for (let i = startIdx; i < text.length; i++) {
+        if (text[i] === '<') {
+            depth++;
+        } else if (text[i] === '>') {
+            depth--;
+            if (depth === 0) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+/**
  * 解析类目录名（用于 Apipost 目录层级）
- * 优先级：@module > @menu > @Api（Swagger）> 类注释第一行
+ * 优先级：@Api（Java 注解）> @module > @menu（JavaDoc 标签）> 类注释第一行
  */
 export function resolveClassDirName(classComment: string | undefined, swaggerApi: string | undefined): string | undefined {
+    // 1. Java 注解优先级最高（如 @Api(tags="xxx")）
+    if (swaggerApi) {
+        const t = swaggerApi.replace(/^\[|\]$/g, '').split(',')[0]?.trim().replace(/"/g, '');
+        if (t) {
+            return t;
+        }
+    }
+    // 2. JavaDoc 自定义标签
     if (classComment) {
         const moduleTag = findCustomTag(classComment, 'module');
         if (moduleTag) {
@@ -941,16 +1254,12 @@ export function resolveClassDirName(classComment: string | undefined, swaggerApi
         if (menuTag) {
             return menuTag;
         }
-        // 兜底：取 JavaDoc 第一行
-        const firstLine = classComment.split(/\r?\n/)[0]?.replace(/^\s*\*\s?/, '').trim();
-        if (firstLine) {
-            return firstLine;
-        }
     }
-    if (swaggerApi) {
-        const t = swaggerApi.replace(/^\[|\]$/g, '').split(',')[0]?.trim().replace(/"/g, '');
-        if (t) {
-            return t;
+    // 3. 兜底：取 JavaDoc 第一行（跳过以 @ 开头的标签行）
+    if (classComment) {
+        const firstLine = classComment.split(/\r?\n/)[0]?.replace(/^\s*\*\s?/, '').trim();
+        if (firstLine && !firstLine.startsWith('@')) {
+            return firstLine;
         }
     }
     return undefined;
@@ -958,9 +1267,9 @@ export function resolveClassDirName(classComment: string | undefined, swaggerApi
 
 /**
  * 从源文件路径解析 module 名
- * - 优先取 `src/main/java/` 之后的第一个目录
- * - 否则取 `src/` 之后
- * - 否则取最末层目录
+ * - 优先取 `src/` 之前的目录名（即 Maven/Gradle 模块名）
+ * - 例如：/project/user-service/src/main/java/com/example/ → user-service
+ * - 如果 src 之前没有有意义的目录，返回 undefined
  */
 export function resolveModuleName(filePath: string): string | undefined {
     if (!filePath) {
@@ -968,33 +1277,15 @@ export function resolveModuleName(filePath: string): string | undefined {
     }
     const norm = filePath.replace(/\\/g, '/');
     const segments = norm.split('/').filter(Boolean);
-    // 1. 找 `src/main/java/`
-    const idx1 = segments.lastIndexOf('java');
-    if (idx1 > 0 && segments[idx1 - 1] === 'main' && segments[idx1 - 2] === 'src') {
-        // 在 java 之后取首个非空目录
-        const after = segments[idx1 + 1];
-        if (after) {
-            return after;
+    // 找 `src/` 的位置
+    const srcIdx = segments.lastIndexOf('src');
+    if (srcIdx > 0) {
+        // src 之前的目录即为模块名
+        const moduleName = segments[srcIdx - 1];
+        // 排除项目根目录常见的无意义名称
+        if (moduleName && moduleName !== 'src' && moduleName !== 'main' && moduleName !== 'java') {
+            return moduleName;
         }
-    }
-    // 2. 找 `src/`
-    const idx2 = segments.lastIndexOf('src');
-    if (idx2 >= 0 && idx2 < segments.length - 1) {
-        const after = segments[idx2 + 1];
-        if (after && after !== 'main' && after !== 'java') {
-            return after;
-        }
-        // 如果 src 之后是 main/java，尝试 main 之后再下一层
-        if (after === 'main' && segments[idx2 + 2] === 'java') {
-            const next = segments[idx2 + 3];
-            if (next) {
-                return next;
-            }
-        }
-    }
-    // 3. 取上一级目录
-    if (segments.length >= 2) {
-        return segments[segments.length - 2];
     }
     return undefined;
 }

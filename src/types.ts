@@ -46,6 +46,8 @@ export interface ApiEndpoint {
     requestBodyType?: string;
     /** 方法返回类型 */
     returnType?: string;
+    /** 响应 DTO 展开后的字段列表 */
+    responseFields?: ApiParam[];
     /** 由 @module/@menu/@Api/类注释第一行 解析出的类目录名 */
     classDirName?: string;
     /** 由 Maven/Gradle 模块名或目录相对路径解析出的 module 名称（autoModuleAndClassDir 使用） */

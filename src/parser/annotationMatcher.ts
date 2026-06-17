@@ -102,7 +102,16 @@ function isSpringAnnotation(name: string): boolean {
         short === 'RequestHeader' ||
         short === 'ApiOperation' ||
         short === 'Api' ||
-        short === 'ApiParam'
+        short === 'ApiParam' ||
+        short === 'ApiModelProperty' ||
+        short === 'NotNull' ||
+        short === 'NotEmpty' ||
+        short === 'NotBlank' ||
+        short === 'Size' ||
+        short === 'Min' ||
+        short === 'Max' ||
+        short === 'Valid' ||
+        short === 'Deprecated'
     );
 }
 

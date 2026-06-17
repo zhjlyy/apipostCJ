@@ -339,11 +339,14 @@ async function ensureChildDirectory(
 /** 在指定父级下查找同名目录 */
 function findChildByName(
     tree: ApipostDirectory[],
-    parentId: string | null,
+    parentId: string | null | undefined,
     name: string
 ): { id: string; name: string } | undefined {
     for (const node of tree) {
-        if (node.parentId === parentId && node.name === name) {
+        // parentId 为 null/undefined 表示根目录下的子节点
+        const nodeParentId = node.parentId ?? null;
+        const targetParentId = parentId ?? null;
+        if (nodeParentId === targetParentId && node.name === name) {
             return { id: node.id, name: node.name };
         }
         if (node.children && node.children.length > 0) {

@@ -171,6 +171,14 @@ export function parseJavadoc(raw: string): ExtractedComment {
             }
             returnDesc = trimmed.replace(/^@return\s*/, '').trim();
             lastTagType = 'return';
+        } else if (trimmed.startsWith('@')) {
+            // 其他 @ 标签（如 @since、@author、@deprecated、@see 等）
+            // 不放入正文，flush 文本缓冲
+            if (textBuffer.length > 0) {
+                textParagraphs.push(textBuffer.join(' ').trim());
+                textBuffer = [];
+            }
+            lastTagType = null;
         } else if (lastTagType === 'param' && params.length > 0) {
             // 多行 @param 描述的续行，追加到上一个参数的 description
             params[params.length - 1].description += ' ' + trimmed;
